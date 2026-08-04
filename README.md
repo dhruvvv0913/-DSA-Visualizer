@@ -4,8 +4,9 @@ An animated, console based visualiser for the classic sorting and searching algo
 written from scratch in standard C++.
 
 Every comparison, every swap and every recursive call is drawn on screen as a colour
-coded bar chart, while a live statistics panel counts the work being done. Nothing is
-sorted or searched by the standard library — all seven algorithms are hand written.
+coded bar chart, while a live statistics panel counts the work being done. All seven
+algorithms are hand written — the standard library sorts nothing here except inside the
+self-test, where it serves as an independent reference.
 
 > **Minor Project** — C, C++ with DSA Program (InternsElite)
 > Mentor: Alok Maddheshiya
@@ -119,7 +120,7 @@ All four optional bonus features from the project brief are implemented, plus se
 | Bonus feature | Where to find it |
 |---|---|
 | **Graphical bars visualisation** | Every algorithm run — colour coded, with value and index labels |
-| **Speed control** | `Settings → Animation speed`, six presets, or `+` / `-` live during an animation |
+| **Speed control** | `Settings → Animation speed` — an Auto mode that scales to the array size, six manual presets, or `+` / `-` live during an animation |
 | **Complexity comparison chart** | Main menu option 4 — a full big-O table plus a log scaled growth chart |
 | **Dark / Light mode UI** | `Settings → Toggle dark / light theme`, applied to every screen |
 
@@ -139,6 +140,15 @@ Extras beyond the brief:
   the shape of the data readable at a glance while leaving the bright role colours to
   carry the meaning.
 - **Animated title screen** — a block-letter reveal with a travelling highlight.
+- **Built-in self-test** — runs all seven algorithms over 130 arrays chosen to break them
+  (sorted, reversed, all-identical, two-valued, heavy duplicates, sizes 2 to 24) plus 100
+  random ones, and checks **4,000+ assertions** in under a fifth of a second. See
+  [How Correctness Is Verified](#how-correctness-is-verified).
+- **Auto animation speed** — the delay is derived from how many frames the run will
+  actually draw, so a 6-element sort steps slowly enough to follow and a 24-element one
+  still finishes in about the same time. A fixed delay does not survive a quadratic
+  algorithm: at 150 ms a 24-element Bubble Sort draws 864 frames and takes **over two
+  minutes**, which reads as a hung program.
 - **Benchmark mode** — races all five sorts on the *same* randomly generated array (up to
   2000 elements) and reports comparisons, swaps and measured time side by side, with
   relative bar charts. At `n = 500` the gap between `O(n²)` and `O(n log n)` becomes
@@ -166,10 +176,14 @@ Extras beyond the brief:
 | **Compiler tested** | MinGW g++ 6.3.0 on Windows 11 |
 | **Build system** | None needed — one translation unit, one command |
 
-The STL is used for containers, random number generation and timing. It is **never** used
-to do the actual sorting or searching: there is no `std::sort`, no `std::find`, no
-`std::binary_search` anywhere in the program. Even the "sort the array for me" menu action
-runs this project's own Merge Sort.
+The STL is used for containers, random number generation and timing. **No algorithm in
+this program is implemented with it** — there is no `std::sort`, no `std::find` and no
+`std::binary_search` in any of the seven implementations, and even the "sort the array for
+me" menu action runs this project's own Merge Sort.
+
+The one exception is the self-test harness, which uses `std::sort` on purpose as an
+independent oracle. Checking this project's Bubble Sort with this project's Merge Sort
+would be circular, so the reference has to come from outside the code being tested.
 
 ---
 
@@ -248,8 +262,10 @@ Available at any point **during an animation**:
 | <kbd>C</kbd> | Show / hide the live pseudocode panel |
 | <kbd>Q</kbd> | Abort the animation (results are still computed and reported) |
 
-Six speed presets are available: Very Slow (700 ms), Slow (330 ms), Normal (150 ms),
-Fast (65 ms), Very Fast (22 ms) and Instant (0 ms).
+Speed defaults to **Auto**, which sets the frame delay from how many frames the run will
+actually draw, so every run takes roughly twelve seconds whatever the array size. Six
+manual presets are also available — Very Slow (700 ms), Slow (330 ms), Normal (150 ms),
+Fast (65 ms), Very Fast (22 ms) and Instant (0 ms) — and picking one turns Auto off.
 
 ---
 
@@ -339,13 +355,50 @@ The theme applies to every screen, not just the bars.
 
 ## How Correctness Is Verified
 
-Rather than assuming the algorithms are right, the program checks:
+Watching one sort finish proves very little, so the program does not ask you to take its
+word for it.
 
-- **Every sort is verified.** After each run the output is checked to be in ascending
-  order, and the result screen says so explicitly. A failure would be reported as a bug
-  rather than hidden.
-- **The benchmark verifies every algorithm it times**, and prints a warning if any of them
-  produces an unsorted result.
+### The built-in self-test (main menu option 6)
+
+![Self-test](screenshots/11-self-test.png)
+
+It runs every algorithm over **130 arrays chosen to break things** — already sorted,
+exactly reversed, every element identical, only two distinct values, heavy duplicates, the
+smallest legal size — plus 100 random ones, and checks **two** properties of every result:
+
+1. the output is in non-decreasing order, **and**
+2. the output is a *permutation* of the input.
+
+The second check is the one that matters. A "sort" that returns n copies of the smallest
+element passes the first check perfectly.
+
+The reference used for the permutation check is `std::sort`. That is deliberate: checking
+this project's Bubble Sort with this project's Merge Sort would be circular, so the oracle
+has to come from outside the code under test. **This is the only place in the program the
+standard library is allowed to sort anything**, and it is confined to the test harness.
+
+The searches are tested too: every value that is present must be found at an index that
+really holds it, and a value that is absent must report not-found.
+
+### The self-test was itself tested
+
+A test that cannot fail is worthless, so it was checked by deliberately breaking two
+algorithms and confirming it noticed — and that it noticed for the *right reason*:
+
+| Injected bug | What the self-test reported |
+|---|---|
+| Bubble Sort's inner loop stops one element short | `Bubble Sort — 100 failed — not ordered: [ 2, 1 ]` |
+| Insertion Sort writes the wrong value into the gap | `Insertion Sort — 117 failed — lost/duplicated values: [ 1, 2 ]` |
+
+In both cases the other four sorts still passed, so the harness isolates the fault rather
+than just going red everywhere.
+
+### Continuous checks during normal use
+
+- **Every sort is verified after it runs.** The result screen confirms the output is in
+  ascending order. A failure would be reported as a bug rather than hidden.
+- **The benchmark verifies every algorithm it times**, and warns if any produces an
+  unsorted result.
 - **Aborting an animation does not corrupt anything.** If you press `Q` half way through,
   the array is restored and the sort is re-run silently, so the reported output and counts
   are always complete and correct.
@@ -381,7 +434,7 @@ The operation counts were also checked by hand. For the input `[5, 3, 9, 1, 7, 2
 | 2 | `Theme` — the dark / light palettes and the glyph sets |
 | 3 | `InputReader` — validated input |
 | 4 | `Statistics` — the operation counters |
-| 5 | `Visualizer` — the drawing engine, speed control and interactive keys |
+| 5 | `Visualizer` — the drawing engine, Auto/manual speed control and interactive keys |
 | 6 | `Algorithm` / `SortingAlgorithm` / `SearchingAlgorithm` — the class hierarchy |
 | 7 | The five sorting algorithms |
 | 8 | The two searching algorithms |
@@ -450,6 +503,15 @@ be coloured, so a plain block chart can only show as many distinct bar lengths a
 rows. Putting a lower half block (`▄`) on top of the last full cell doubles that, which
 is the difference between two nearly equal values looking identical and looking
 different. ASCII mode has no half block, so it snaps to whole cells instead.
+
+**A fixed frame delay does not survive a quadratic algorithm.** The number of frames a
+sort draws grows with its complexity, so a delay tuned for eight elements is unusable at
+twenty-four: at 150 ms a 24-element Bubble Sort draws 864 frames and runs for **over two
+minutes**, which a viewer reads as a crash rather than as a slow sort. Each algorithm
+therefore declares `estimatedFrames(n)` — a rough count derived from its own complexity
+class, accurate to an order of magnitude, which is all that is needed — and Auto mode
+divides a target duration by it. Small arrays step slowly enough to follow; large ones
+move briskly; both finish in about the same time.
 
 **Limits.** Arrays for visualisation are 2–24 elements with values 1–99. That is not a
 technical limit — it is the range where a bar chart with readable value labels fits in a

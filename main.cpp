@@ -856,7 +856,8 @@ class Visualizer {
 public:
     explicit Visualizer(Theme& theme)
         : theme_(theme), silent_(false), stepMode_(false),
-          speedIndex_(kDefaultSpeed), controlsRow_(0), aborted_(false),
+          speedIndex_(kDefaultSpeed), autoSpeed_(true), autoDelayMs_(150),
+          controlsRow_(0), aborted_(false),
           showCode_(true), codeLine_(-1), codeTitle_("ALGORITHM") {}
 
     /* ---- configuration ------------------------------------------------- */
@@ -873,23 +874,47 @@ public:
     bool stepMode() const         { return stepMode_; }
 
     int  speedIndex() const       { return speedIndex_; }
+
+    /* Choosing a preset explicitly turns Auto off - the user has taken over. */
     void setSpeedIndex(int index) {
         if (index < 0) index = 0;
         if (index >= kSpeedCount) index = kSpeedCount - 1;
         speedIndex_ = index;
+        autoSpeed_  = false;
     }
     static int speedCount()                 { return kSpeedCount; }
     static std::string speedName(int index) { return kSpeeds[index].name; }
     static int speedDelay(int index)        { return kSpeeds[index].delayMs; }
-    std::string currentSpeedName() const    { return kSpeeds[speedIndex_].name; }
-    int currentDelay() const                { return kSpeeds[speedIndex_].delayMs; }
+
+    bool autoSpeed() const     { return autoSpeed_; }
+    void setAutoSpeed(bool on) { autoSpeed_ = on; }
+
+    /* Just the name - the controls line appends the delay itself. */
+    std::string currentSpeedName() const {
+        return autoSpeed_ ? std::string("Auto") : std::string(kSpeeds[speedIndex_].name);
+    }
+    int currentDelay() const {
+        return autoSpeed_ ? autoDelayMs_ : kSpeeds[speedIndex_].delayMs;
+    }
+    static int targetRunSeconds() { return kTargetRunMs / 1000; }
 
     /* ---- lifecycle of one animated run --------------------------------- */
+    /*
+     * `estimatedFrames` is how many frames this run is expected to draw.
+     *
+     * A fixed delay does not survive contact with a quadratic algorithm: at
+     * 150 ms a 24 element Bubble Sort draws 864 frames and takes over two
+     * minutes, which reads as a hung program rather than as a slow one.  In
+     * Auto mode the delay is derived from the estimate so that any run, on any
+     * array, takes roughly the same comfortable length of time - small arrays
+     * step slowly enough to follow, large ones move briskly.
+     */
     void beginRun(const std::string& algorithmName,
                   const std::string& subtitle,
                   const std::string& complexity,
                   const std::vector<LegendEntry>& legend,
-                  const std::vector<std::string>& pseudocode) {
+                  const std::vector<std::string>& pseudocode,
+                  long long estimatedFrames) {
         algorithmName_ = algorithmName;
         subtitle_      = subtitle;
         complexity_    = complexity;
@@ -897,6 +922,12 @@ public:
         code_          = pseudocode;
         codeLine_      = -1;
         aborted_       = false;
+
+        long long frames = estimatedFrames > 0 ? estimatedFrames : 1;
+        long long delay  = kTargetRunMs / frames;
+        if (delay < kAutoMinDelayMs) delay = kAutoMinDelayMs;
+        if (delay > kAutoMaxDelayMs) delay = kAutoMaxDelayMs;
+        autoDelayMs_ = static_cast<int>(delay);
         if (!silent_ && Console::richOutput()) {
             std::cout << theme_.base();
             Console::clear();
@@ -1376,10 +1407,17 @@ private:
     static const int kDefaultSpeed = 2;
     static const SpeedSetting kSpeeds[kSpeedCount];
 
+    /* Auto mode aims for a run of about this long, whatever the array size. */
+    static const int kTargetRunMs    = 12000;
+    static const int kAutoMinDelayMs = 5;
+    static const int kAutoMaxDelayMs = 450;
+
     Theme&                   theme_;
     bool                     silent_;
     bool                     stepMode_;
     int                      speedIndex_;
+    bool                     autoSpeed_;
+    int                      autoDelayMs_;
     int                      controlsRow_;
     bool                     aborted_;
     bool                     showCode_;
@@ -1396,6 +1434,9 @@ const int    Visualizer::kSpeedCount;
 const int    Visualizer::kDefaultSpeed;
 const int    Visualizer::kFixedRows;
 const int    Visualizer::kCodeGutter;
+const int    Visualizer::kTargetRunMs;
+const int    Visualizer::kAutoMinDelayMs;
+const int    Visualizer::kAutoMaxDelayMs;
 const size_t Visualizer::kLegendRows;
 const Visualizer::SpeedSetting Visualizer::kSpeeds[Visualizer::kSpeedCount] = {
     { "Very Slow", 700 },
@@ -1442,11 +1483,25 @@ public:
      * and the bars stay in step with each other. */
     virtual std::vector<std::string> pseudocode() const = 0;
 
+    /*
+     * Roughly how many frames this algorithm will draw for an input of size n.
+     *
+     * Only ever used to choose an animation delay, so an order of magnitude is
+     * plenty - it does not need to be exact, it needs to know the difference
+     * between n log n and n squared.
+     */
+    virtual long long estimatedFrames(int n) const = 0;
+
     const Statistics& stats() const { return stats_; }
 
 protected:
     /* Is the animation actually on screen right now? */
     bool animating() const { return viz_.animating(); }
+
+    /* log2(n), for the estimates of the divide and conquer algorithms. */
+    static double log2Of(int n) {
+        return n > 1 ? std::log(static_cast<double>(n)) / std::log(2.0) : 1.0;
+    }
 
     /*
      * Run `build` only when the animation is visible.  Every frame in this
@@ -1517,7 +1572,8 @@ public:
         /* 1. The animated run the user actually watches. */
         stats_.reset();
         viz_.setSilent(false);
-        viz_.beginRun(name(), category(), complexity().average, legend(), pseudocode());
+        viz_.beginRun(name(), category(), complexity().average, legend(), pseudocode(),
+                      estimatedFrames(static_cast<int>(data.size())));
         try {
             sort(data);
             finalSweep(data);
@@ -1636,7 +1692,8 @@ public:
         int result = -1;
         stats_.reset();
         viz_.setSilent(false);
-        viz_.beginRun(name(), category(), complexity().average, legend(), pseudocode());
+        viz_.beginRun(name(), category(), complexity().average, legend(), pseudocode(),
+                      estimatedFrames(static_cast<int>(data.size())));
         try {
             result = search(data, target);
             showOutcome(data, target, result);
@@ -1656,6 +1713,16 @@ public:
 
         stats_ = snapshot;
         stats_.setMicroseconds(micros);
+        return result;
+    }
+
+    /* Search without any animation - used by the self test. */
+    int runSilently(const std::vector<int>& data, int target) {
+        stats_.reset();
+        bool wasSilent = viz_.silent();
+        viz_.setSilent(true);
+        int result = search(data, target);
+        viz_.setSilent(wasSilent);
         return result;
     }
 
@@ -1719,6 +1786,11 @@ public:
         code.push_back("  if not swapped");             // 6
         code.push_back("    break        // sorted");   // 7
         return code;
+    }
+
+    /* comparisons ~n^2/2, and each swap draws two more frames. */
+    long long estimatedFrames(int n) const {
+        return static_cast<long long>(n) * n + 2 * n;
     }
 
 protected:
@@ -1806,6 +1878,11 @@ public:
         code.push_back("  if min != i");               // 5
         code.push_back("    swap A[i], A[min]");       // 6
         return code;
+    }
+
+    /* Always n^2/2 comparisons, but at most n swaps. */
+    long long estimatedFrames(int n) const {
+        return static_cast<long long>(n) * n / 2 + 3 * n;
     }
 
     std::vector<LegendEntry> legend() const {
@@ -1918,6 +1995,11 @@ public:
         return code;
     }
 
+    /* On random data roughly n^2/4 comparisons, two frames per shift. */
+    long long estimatedFrames(int n) const {
+        return static_cast<long long>(n) * n * 3 / 4 + 2 * n;
+    }
+
     std::vector<LegendEntry> legend() const {
         std::vector<LegendEntry> entries;
         entries.push_back(LegendEntry(ROLE_SORTED,  "sorted prefix"));
@@ -2012,6 +2094,11 @@ public:
         code.push_back("    write it to A[k]");        // 7
         code.push_back("    copy any remainder");      // 8
         return code;
+    }
+
+    /* Two frames per element per level, over log2(n) levels. */
+    long long estimatedFrames(int n) const {
+        return static_cast<long long>(2.5 * n * log2Of(n)) + 2 * n;
     }
 
     std::vector<LegendEntry> legend() const {
@@ -2177,6 +2264,11 @@ public:
         return code;
     }
 
+    /* One compare frame plus two swap frames per element per level. */
+    long long estimatedFrames(int n) const {
+        return static_cast<long long>(3.0 * n * log2Of(n)) + 2 * n;
+    }
+
     std::vector<LegendEntry> legend() const {
         std::vector<LegendEntry> entries;
         entries.push_back(LegendEntry(ROLE_RANGE,   "partition"));
@@ -2329,6 +2421,9 @@ public:
         return code;
     }
 
+    /* One frame per element inspected. */
+    long long estimatedFrames(int n) const { return n + 2; }
+
 protected:
     int search(const std::vector<int>& data, int target) {
         int n = static_cast<int>(data.size());
@@ -2388,6 +2483,11 @@ public:
         code.push_back("  else");                      // 7
         code.push_back("    search(lo, mid-1)");       // 8
         return code;
+    }
+
+    /* Two frames per halving step. */
+    long long estimatedFrames(int n) const {
+        return static_cast<long long>(2.0 * log2Of(n)) + 3;
     }
 
     bool requiresSortedInput() const { return true; }
@@ -2729,21 +2829,23 @@ private:
         menuItem(3, "Array Setup",               "type your own, or generate a test case");
         menuItem(4, "Complexity Comparison Chart", "big-O reference for all seven algorithms");
         menuItem(5, "Benchmark All Sorts",       "race all five sorts on the same data");
-        menuItem(6, "Settings",                  "speed, dark/light theme, display mode");
-        menuItem(7, "About & Help",              "what each algorithm does");
+        menuItem(6, "Verify All Algorithms",     "self-test against edge cases + 100 random arrays");
+        menuItem(7, "Settings",                  "speed, dark/light theme, display mode");
+        menuItem(8, "About & Help",              "what each algorithm does");
         line();
         menuItem(0, "Exit");
         line();
 
-        int choice = input_.readChoice(0, 7);
+        int choice = input_.readChoice(0, 8);
         switch (choice) {
             case 1: sortingMenu();          break;
             case 2: searchingMenu();        break;
             case 3: arrayMenu();            break;
             case 4: showComplexityChart();  break;
             case 5: runBenchmark();         break;
-            case 6: settingsMenu();         break;
-            case 7: showAbout();            break;
+            case 6: runSelfTest();          break;
+            case 7: settingsMenu();         break;
+            case 8: showAbout();            break;
             case 0: return false;
         }
         return true;
@@ -3112,6 +3214,207 @@ private:
         line(row.str());
     }
 
+    /* ===================================================================== *
+     *  SELF TEST
+     * ---------------------------------------------------------------------
+     *  Watching one sort finish proves very little.  This runs every
+     *  algorithm over a battery of arrays chosen to break things - already
+     *  sorted, exactly reversed, every element identical, only two distinct
+     *  values, heavy duplicates, the smallest legal size - plus a hundred
+     *  random ones, and checks two properties of every result:
+     *
+     *      1. the output is in non decreasing order, and
+     *      2. the output is a PERMUTATION of the input.
+     *
+     *  The second check is the one that matters.  A "sort" that returns
+     *  n copies of the smallest element passes the first check perfectly.
+     *
+     *  The reference used for the permutation check is std::sort. That is a
+     *  deliberate choice: checking this project's Bubble Sort with this
+     *  project's Merge Sort would be circular, so the oracle has to come from
+     *  outside the code under test. It is the ONLY place the standard library
+     *  is allowed to sort anything.
+     * ===================================================================== */
+    struct TestOutcome {
+        std::string name;
+        int         checks;
+        int         failures;
+        std::string firstFailure;
+        TestOutcome() : checks(0), failures(0) {}
+    };
+
+    static bool isPermutationOf(std::vector<int> a, std::vector<int> b) {
+        if (a.size() != b.size()) return false;
+        std::sort(a.begin(), a.end());          // independent oracle - see above
+        std::sort(b.begin(), b.end());
+        return a == b;
+    }
+
+    std::vector<std::vector<int> > buildTestCases() {
+        std::vector<std::vector<int> > cases;
+        const int sizes[] = {2, 3, 5, 8, 13, 24};
+
+        for (int s = 0; s < 6; ++s) {
+            int n = sizes[s];
+
+            std::vector<int> ascending, descending, identical, twoValued, duplicates;
+            for (int i = 0; i < n; ++i) {
+                ascending.push_back(i + 1);
+                descending.push_back(n - i);
+                identical.push_back(42);
+                twoValued.push_back(i % 2 ? 7 : 3);
+                duplicates.push_back((i % 3) + 1);
+            }
+            cases.push_back(ascending);
+            cases.push_back(descending);
+            cases.push_back(identical);
+            cases.push_back(twoValued);
+            cases.push_back(duplicates);
+        }
+
+        /* A hundred random arrays on top of the hand picked edge cases. */
+        std::uniform_int_distribution<int> sizePick(limits::MIN_ELEMENTS, limits::MAX_ELEMENTS);
+        std::uniform_int_distribution<int> valuePick(limits::MIN_VALUE, limits::MAX_VALUE);
+        for (int t = 0; t < 100; ++t) {
+            int n = sizePick(generator_);
+            std::vector<int> sample;
+            for (int i = 0; i < n; ++i) sample.push_back(valuePick(generator_));
+            cases.push_back(sample);
+        }
+        return cases;
+    }
+
+    void runSelfTest() {
+        header("ALGORITHM SELF-TEST",
+               "Every algorithm, against edge cases designed to break it");
+
+        line("   " + theme_.text() + "Each sort must return output that is (1) in order and");
+        line("   " + theme_.text() + "(2) a permutation of its input. The second check is the");
+        line("   " + theme_.text() + "important one - returning n copies of the smallest element");
+        line("   " + theme_.text() + "would pass the first check perfectly.");
+        line();
+        line("   " + theme_.dim() + "Cases: sorted, reversed, all-identical, two-valued, heavy");
+        line("   " + theme_.dim() + "duplicates, sizes 2 to 24, plus 100 random arrays.");
+        line();
+        line("   " + theme_.dim() + "Running . . .");
+
+        std::vector<std::vector<int> > cases = buildTestCases();
+        std::vector<TestOutcome> results;
+
+        /* ---- the five sorts ---- */
+        for (size_t a = 0; a < sorts_.size(); ++a) {
+            SortingAlgorithm& algorithm = *sorts_[a];
+            TestOutcome outcome;
+            outcome.name = algorithm.name();
+
+            for (size_t c = 0; c < cases.size(); ++c) {
+                std::vector<int> working = cases[c];
+                algorithm.runSilently(working);
+                ++outcome.checks;
+
+                bool ordered  = isSorted(working);
+                bool sameBag  = isPermutationOf(cases[c], working);
+                if (!ordered || !sameBag) {
+                    ++outcome.failures;
+                    if (outcome.firstFailure.empty()) {
+                        outcome.firstFailure = (!ordered ? "not ordered: " : "lost/duplicated values: ")
+                                             + util::arrayToString(cases[c]);
+                    }
+                }
+            }
+            results.push_back(outcome);
+        }
+
+        /* ---- the two searches ---- */
+        for (size_t a = 0; a < searches_.size(); ++a) {
+            SearchingAlgorithm& algorithm = *searches_[a];
+            TestOutcome outcome;
+            outcome.name = algorithm.name();
+
+            for (size_t c = 0; c < cases.size(); ++c) {
+                std::vector<int> data = cases[c];
+                if (algorithm.requiresSortedInput())
+                    std::sort(data.begin(), data.end());   // oracle prep, see above
+
+                /* Every value that IS present must be found, at an index that
+                 * really holds it. */
+                for (size_t i = 0; i < data.size(); ++i) {
+                    int found = algorithm.runSilently(data, data[i]);
+                    ++outcome.checks;
+                    if (found < 0 || found >= static_cast<int>(data.size()) ||
+                        data[static_cast<size_t>(found)] != data[i]) {
+                        ++outcome.failures;
+                        if (outcome.firstFailure.empty())
+                            outcome.firstFailure = "failed to locate " + std::to_string(data[i]) +
+                                                   " in " + util::arrayToString(data);
+                    }
+                }
+
+                /* A value that is definitely absent must report not found. */
+                int absent = limits::MAX_VALUE + 1;
+                int found  = algorithm.runSilently(data, absent);
+                ++outcome.checks;
+                if (found != -1) {
+                    ++outcome.failures;
+                    if (outcome.firstFailure.empty())
+                        outcome.firstFailure = "reported a missing value as found";
+                }
+            }
+            results.push_back(outcome);
+        }
+
+        showSelfTestResults(results, cases.size());
+    }
+
+    void showSelfTestResults(const std::vector<TestOutcome>& results, size_t caseCount) const {
+        const Glyphs& g = theme_.glyphs();
+        int totalChecks = 0, totalFailures = 0;
+        for (size_t i = 0; i < results.size(); ++i) {
+            totalChecks   += results[i].checks;
+            totalFailures += results[i].failures;
+        }
+
+        header("SELF-TEST RESULTS",
+               std::to_string(caseCount) + " test arrays  " + g.bullet + "  " +
+               util::withCommas(totalChecks) + " assertions");
+
+        std::ostringstream head;
+        head << "   " << theme_.accent() << util::padRight("ALGORITHM", 18)
+             << util::padLeft("CHECKS", 10) << "   "
+             << util::padLeft("FAILED", 8) << "   RESULT";
+        line(head.str());
+        line("   " + theme_.dim() + util::repeat(g.horizontal, 56));
+
+        for (size_t i = 0; i < results.size(); ++i) {
+            bool passed = results[i].failures == 0;
+            std::ostringstream row;
+            row << "   " << (passed ? theme_.text() : theme_.error())
+                << util::padRight(results[i].name, 18)
+                << util::padLeft(util::withCommas(results[i].checks), 10) << "   "
+                << util::padLeft(util::withCommas(results[i].failures), 8) << "   "
+                << (passed ? theme_.ok() + "PASS" : theme_.error() + "FAIL");
+            line(row.str());
+            if (!passed)
+                line("       " + theme_.error() + results[i].firstFailure);
+        }
+        line();
+
+        if (totalFailures == 0) {
+            line("   " + theme_.ok() + "[OK]  All " + util::withCommas(totalChecks) +
+                 " assertions passed across all seven algorithms.");
+            line();
+            line("   " + theme_.dim() +
+                 "Ordering and permutation were both checked, so a sort cannot pass");
+            line("   " + theme_.dim() +
+                 "here by discarding or duplicating elements.");
+        } else {
+            line("   " + theme_.error() + "[!!]  " + util::withCommas(totalFailures) +
+                 " assertion(s) failed. The failing input is shown above.");
+        }
+        line();
+        input_.pause();
+    }
+
     /* ---- benchmark --------------------------------------------------------- */
     struct BenchmarkResult {
         std::string name;
@@ -3279,8 +3582,11 @@ private:
         while (true) {
             header("SETTINGS", "Tune the visualisation to your liking");
 
-            statLine("Animation speed", viz_.currentSpeedName() + "  (" +
-                     std::to_string(viz_.currentDelay()) + " ms per frame)");
+            statLine("Animation speed", viz_.autoSpeed()
+                     ? "Auto - scaled so each run takes about " +
+                       std::to_string(Visualizer::targetRunSeconds()) + " seconds"
+                     : viz_.currentSpeedName() + "  (" +
+                       std::to_string(viz_.currentDelay()) + " ms per frame)");
             statLine("Step mode",       viz_.stepMode() ? "ON - advance one frame per key press" : "OFF");
             statLine("Theme",           theme_.modeName() + " mode");
             statLine("Character set",   theme_.asciiMode() ? "ASCII only (maximum compatibility)"
@@ -3317,12 +3623,27 @@ private:
 
     void speedMenu() {
         header("ANIMATION SPEED", "How long each frame stays on screen");
+
+        {
+            std::ostringstream hint;
+            hint << "aim for a ~" << Visualizer::targetRunSeconds()
+                 << " second run whatever the array size";
+            if (viz_.autoSpeed()) hint << "   <- current";
+            menuItem(1, "Auto", hint.str());
+        }
         for (int i = 0; i < Visualizer::speedCount(); ++i) {
             std::ostringstream hint;
             hint << Visualizer::speedDelay(i) << " ms per frame";
-            if (i == viz_.speedIndex()) hint << "   <- current";
-            menuItem(i + 1, Visualizer::speedName(i), hint.str());
+            if (!viz_.autoSpeed() && i == viz_.speedIndex()) hint << "   <- current";
+            menuItem(i + 2, Visualizer::speedName(i), hint.str());
         }
+        line();
+        line("   " + theme_.dim() +
+             "Auto is recommended: a fixed delay that suits 8 elements makes a");
+        line("   " + theme_.dim() +
+             "24 element Bubble Sort take over two minutes, because the number of");
+        line("   " + theme_.dim() +
+             "frames grows with the square of the input.");
         line();
         line("   " + theme_.dim() +
              "You can also change speed mid animation with the + and - keys.");
@@ -3330,9 +3651,10 @@ private:
         menuItem(0, "Back");
         line();
 
-        int choice = input_.readChoice(0, Visualizer::speedCount());
+        int choice = input_.readChoice(0, Visualizer::speedCount() + 1);
         if (choice == 0) return;
-        viz_.setSpeedIndex(choice - 1);
+        if (choice == 1) viz_.setAutoSpeed(true);
+        else             viz_.setSpeedIndex(choice - 2);
     }
 
     /* ---- about -------------------------------------------------------------- */
