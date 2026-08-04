@@ -42,10 +42,13 @@ nearly sorted test case — pick an algorithm, and watch it run. The display sho
 - **the array as a bar chart**, with each bar coloured by the role it is playing right
   now: being compared, being swapped, acting as a pivot, already in its final place,
   or ruled out of a search;
+- **the algorithm's own pseudocode, beside the chart, with the executing line lit up**,
+  so you can see which line of code is causing the movement you are watching;
 - **a status line in plain English** describing the exact step being taken, e.g.
   `Pass 3 of 11:  A[4]=63 > key 27  ->  shifting it right into index 5`;
 - **a live statistics panel** counting comparisons, swaps, array writes, the current
   pass, and — for the recursive algorithms — the current and maximum recursion depth;
+- **a live "sortedness" meter** measuring how much disorder is left in the array;
 - **the time complexity** of the running algorithm, on screen the whole time.
 
 When the run finishes you get a full report: the input, the output, a verification that
@@ -122,6 +125,20 @@ All four optional bonus features from the project brief are implemented, plus se
 
 Extras beyond the brief:
 
+- **Live pseudocode panel** — each algorithm's own pseudocode is printed beside the
+  chart and the executing line is marked and highlighted, frame by frame. The code and
+  the bars tell the same story at the same instant. Toggle with <kbd>C</kbd>.
+- **Sortedness meter** — a live bar showing how close the array is to sorted, measured
+  by counting *inversions* rather than steps completed. Bubble Sort creeps up it
+  steadily; Quick Sort jumps in steps as each pivot lands. See
+  [Design Notes](#design-notes) for why this is the honest way to measure progress.
+- **Half-block bar resolution** — bars are drawn to half-cell precision using `▄`,
+  doubling the vertical resolution so two nearly equal values look different rather
+  than identical.
+- **Height-shaded bars** — idle bars are shaded along a gradient by value, which makes
+  the shape of the data readable at a glance while leaving the bright role colours to
+  carry the meaning.
+- **Animated title screen** — a block-letter reveal with a travelling highlight.
 - **Benchmark mode** — races all five sorts on the *same* randomly generated array (up to
   2000 elements) and reports comparisons, swaps and measured time side by side, with
   relative bar charts. At `n = 500` the gap between `O(n²)` and `O(n log n)` becomes
@@ -228,6 +245,7 @@ Available at any point **during an animation**:
 | <kbd>Space</kbd> | Pause / resume |
 | <kbd>+</kbd> / <kbd>-</kbd> | Speed up / slow down |
 | <kbd>S</kbd> | Toggle step mode — one frame per key press |
+| <kbd>C</kbd> | Show / hide the live pseudocode panel |
 | <kbd>Q</kbd> | Abort the animation (results are still computed and reported) |
 
 Six speed presets are available: Very Slow (700 ms), Slow (330 ms), Normal (150 ms),
@@ -237,6 +255,12 @@ Fast (65 ms), Very Fast (22 ms) and Instant (0 ms).
 
 ## Sample Output Screenshots
 
+### Title screen
+
+Revealed a column at a time, with a highlight that travels across the letters.
+
+![Title screen](screenshots/00-splash.png)
+
 ### Main menu
 
 The working array is always visible, along with whether it is currently sorted.
@@ -245,8 +269,9 @@ The working array is always visible, along with whether it is currently sorted.
 
 ### Bubble Sort — a swap in progress
 
-The two bars being exchanged are red; the tail of the array already in its final place
-turns green. The status line names the exact comparison that triggered the swap.
+The two bars being exchanged are red, and the pseudocode panel on the right marks
+`swap A[j], A[j+1]` as the line responsible. Idle bars are shaded by height; the
+`Sorted` meter shows how much disorder is left.
 
 ![Bubble Sort](screenshots/02-bubble-sort.png)
 
@@ -405,6 +430,26 @@ input, where Lomuto partitioning degrades to `O(n²)` *and* recurses `n` deep. R
 keeps the recursion shallow, so the benchmark stays safe at its 2000 element maximum. If
 you want to see the worst case, use `Array Setup → Generate sorted array` and run Quick
 Sort on it directly.
+
+**Progress is measured in inversions, not in steps.** The `Sorted` meter counts pairs
+that are still in the wrong order relative to each other, against the worst possible
+number of them. "Percentage of steps completed" would be a lie — it would move at a
+constant rate regardless of what the algorithm achieved. Inversions actually measure
+disorder draining out of the array, which is why the meter behaves differently for each
+algorithm: Bubble Sort climbs it smoothly, Selection Sort barely moves until late, and
+Quick Sort jumps each time a pivot lands. It is `O(n²)` to compute, which is fine because
+it only runs while animating, on arrays of at most 24 elements.
+
+**The pseudocode panel costs no vertical space.** It is drawn into rows the bar chart is
+already occupying, to the right of the bars. It appears only when the chart leaves enough
+width for it — a wide array on a narrow console gets the chart alone rather than a
+squashed mess of both.
+
+**Bars are drawn to half-cell precision.** A terminal cell is the smallest thing that can
+be coloured, so a plain block chart can only show as many distinct bar lengths as it has
+rows. Putting a lower half block (`▄`) on top of the last full cell doubles that, which
+is the difference between two nearly equal values looking identical and looking
+different. ASCII mode has no half block, so it snaps to whole cells instead.
 
 **Limits.** Arrays for visualisation are 2–24 elements with values 1–99. That is not a
 technical limit — it is the range where a bar chart with readable value labels fits in a

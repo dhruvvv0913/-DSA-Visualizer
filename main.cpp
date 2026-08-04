@@ -426,20 +426,26 @@ struct Glyphs {
     std::string topLeft, topRight, bottomLeft, bottomRight;
     std::string bannerTL, bannerTR, bannerBL, bannerBR, bannerH, bannerV;
     std::string bullet;
+    std::string halfBlock;   // bottom half of a cell - doubles the bar resolution
+    std::string shade;       // empty part of a meter
+    std::string marker;      // points at the executing pseudocode line
+    bool        fineBars;    // false for ASCII, where half heights are not drawable
 };
 
 static const Glyphs UNICODE_GLYPHS = {
     "█", "─", "│", "─",
     "┌", "┐", "└", "┘",
     "╔", "╗", "╚", "╝", "═", "║",
-    "·"
+    "·",
+    "▄", "░", "▶", true
 };
 
 static const Glyphs ASCII_GLYPHS = {
     "#", "-", "|", "-",
     "+", "+", "+", "+",
     "+", "+", "+", "+", "=", "|",
-    "*"
+    "*",
+    "_", ".", ">", false
 };
 
 enum ThemeMode { THEME_DARK, THEME_LIGHT };
@@ -483,6 +489,29 @@ public:
     std::string error()  const { return colour(mode_ == THEME_DARK ? rgb(248, 105, 105) : rgb(198,  40,  40)); }
     std::string text()   const { return colour(rgb(textR(), textG(), textB())); }
 
+    /*
+     * Colour for an idle bar, shaded by how tall it is.
+     *
+     * The ramp deliberately stays inside one hue family (cool blues in dark
+     * mode, slate blues in light mode).  A rainbow would look busier but would
+     * compete with the role colours - and the role colours are the ones that
+     * carry meaning, so they have to be the brightest thing on screen.
+     * `height` is the value normalised to 0..1.
+     */
+    std::string gradientColour(double height) const {
+        if (!Console::richOutput()) return "";
+        if (height < 0.0) height = 0.0;
+        if (height > 1.0) height = 1.0;
+
+        Rgb low, high;
+        if (mode_ == THEME_DARK) { low = rgb(62, 78, 138);  high = rgb(126, 196, 245); }
+        else                     { low = rgb(150, 165, 200); high = rgb(58, 96, 168);  }
+
+        return colour(rgb(lerp(low.r, high.r, height),
+                          lerp(low.g, high.g, height),
+                          lerp(low.b, high.b, height)));
+    }
+
     /* Colour for a bar, chosen from the role the algorithm assigned to it. */
     std::string barColour(BarRole role) const {
         if (!Console::richOutput()) return "";
@@ -519,6 +548,10 @@ public:
 private:
     struct Rgb { int r, g, b; };
     static Rgb rgb(int r, int g, int b) { Rgb c = {r, g, b}; return c; }
+
+    static int lerp(int from, int to, double t) {
+        return static_cast<int>(from + (to - from) * t + 0.5);
+    }
 
     static std::string foreground(int r, int g, int b) {
         std::ostringstream out;
@@ -823,7 +856,8 @@ class Visualizer {
 public:
     explicit Visualizer(Theme& theme)
         : theme_(theme), silent_(false), stepMode_(false),
-          speedIndex_(kDefaultSpeed), controlsRow_(0), aborted_(false) {}
+          speedIndex_(kDefaultSpeed), controlsRow_(0), aborted_(false),
+          showCode_(true), codeLine_(-1), codeTitle_("ALGORITHM") {}
 
     /* ---- configuration ------------------------------------------------- */
     void setSilent(bool silent)   { silent_ = silent; }
@@ -854,11 +888,14 @@ public:
     void beginRun(const std::string& algorithmName,
                   const std::string& subtitle,
                   const std::string& complexity,
-                  const std::vector<LegendEntry>& legend) {
+                  const std::vector<LegendEntry>& legend,
+                  const std::vector<std::string>& pseudocode) {
         algorithmName_ = algorithmName;
         subtitle_      = subtitle;
         complexity_    = complexity;
         legend_        = legend;
+        code_          = pseudocode;
+        codeLine_      = -1;
         aborted_       = false;
         if (!silent_ && Console::richOutput()) {
             std::cout << theme_.base();
@@ -867,6 +904,13 @@ public:
     }
 
     bool aborted() const { return aborted_; }
+
+    /* Which pseudocode line is executing right now (-1 for none).  Algorithms
+     * call this immediately before drawing a frame. */
+    void setCodeLine(int line) { codeLine_ = line; }
+
+    void setShowCode(bool on)  { showCode_ = on; }
+    bool showCode() const      { return showCode_; }
 
     /*
      * Draw one frame and then wait according to the current speed setting.
@@ -896,12 +940,14 @@ public:
 private:
     /* ---- layout -------------------------------------------------------- */
     struct Layout {
-        int barWidth;    // columns of block characters per bar
-        int gap;         // blank columns between bars
-        int cell;        // barWidth + gap
-        int height;      // number of rows the chart is tall
-        int chartWidth;  // total columns the chart occupies
-        int panelWidth;  // width of the header / statistics boxes
+        int  barWidth;    // columns of block characters per bar
+        int  gap;         // blank columns between bars
+        int  cell;        // barWidth + gap
+        int  height;      // number of rows the chart is tall
+        int  chartWidth;  // total columns the chart occupies
+        int  panelWidth;  // width of the header / statistics boxes
+        bool showCode;    // is there room for the pseudocode panel?
+        int  codeWidth;   // columns reserved for it
     };
 
     Layout computeLayout(size_t count) const {
@@ -929,12 +975,39 @@ private:
         if (layout.height < 4)  layout.height = 4;
         if (layout.height > 14) layout.height = 14;
 
+        /*
+         * The pseudocode panel sits beside the chart, in rows the chart is
+         * already using - so it costs no vertical space at all.  It only
+         * appears when the chart leaves enough width for it; a wide array on a
+         * narrow console silently gets the chart alone rather than a squashed
+         * mess of both.
+         */
+        layout.codeWidth = codeColumnWidth();
+        layout.showCode  = showCode_ && !code_.empty() &&
+                           layout.chartWidth + kCodeGutter + layout.codeWidth <= available &&
+                           layout.height >= static_cast<int>(code_.size()) + 2;
+        if (!layout.showCode) layout.codeWidth = 0;
+
         /* The panel sits inside a 2 column margin and adds its own two corner
          * characters, so it must stay 4 columns clear of the usable width. */
-        layout.panelWidth = layout.chartWidth + 2;
+        int contentWidth = layout.chartWidth +
+                           (layout.showCode ? kCodeGutter + layout.codeWidth : 0);
+        layout.panelWidth = contentWidth + 2;
         if (layout.panelWidth < 62)            layout.panelWidth = 62;
         if (layout.panelWidth > available - 4) layout.panelWidth = available - 4;
         return layout;
+    }
+
+    /* Widest pseudocode line, plus room for the "executing" marker. */
+    int codeColumnWidth() const {
+        int widest = 0;
+        for (size_t i = 0; i < code_.size(); ++i) {
+            int width = util::displayWidth(code_[i]);
+            if (width > widest) widest = width;
+        }
+        int titleWidth = util::displayWidth(codeTitle_);
+        if (titleWidth > widest) widest = titleWidth;
+        return widest + 3;              // "> " marker plus a trailing column
     }
 
     /* ---- frame construction -------------------------------------------- */
@@ -945,17 +1018,37 @@ private:
         const Glyphs& g = theme_.glyphs();
         Layout layout   = computeLayout(data.size());
 
-        /* Scale every value to a bar height in rows. */
+        /*
+         * Scale every value to a bar height measured in HALF rows.
+         *
+         * A terminal cell is the smallest thing that can be coloured, so a
+         * plain block chart can only ever show `height` distinct bar lengths.
+         * Drawing a lower half block on top of the last full cell doubles that
+         * resolution for free, which is the difference between two nearly equal
+         * values looking identical and looking different.
+         */
+        const bool fine = theme_.glyphs().fineBars;
         int maxValue = 1;
         for (size_t i = 0; i < data.size(); ++i)
             if (data[i] > maxValue) maxValue = data[i];
 
-        std::vector<int> heights(data.size(), 0);
+        const int halfRows = layout.height * 2;
+        std::vector<int> heights(data.size(), 0);   // in half rows
         for (size_t i = 0; i < data.size(); ++i) {
             if (data[i] <= 0) { heights[i] = 0; continue; }
-            double scaled = (static_cast<double>(data[i]) * layout.height) / maxValue;
-            int rows = static_cast<int>(scaled + 0.5);
-            heights[i] = rows < 1 ? 1 : rows;
+            double scaled = (static_cast<double>(data[i]) * halfRows) / maxValue;
+            int halves = static_cast<int>(scaled + 0.5);
+            if (!fine) halves = ((halves + 1) / 2) * 2;   // snap to whole cells
+            heights[i] = halves < 1 ? 1 : halves;
+        }
+
+        /* Idle bars are shaded by height; anything with a role keeps its
+         * meaningful colour. */
+        std::vector<std::string> barColours(data.size());
+        for (size_t i = 0; i < data.size(); ++i) {
+            barColours[i] = (roles[i] == ROLE_NORMAL)
+                ? theme_.gradientColour(static_cast<double>(data[i]) / maxValue)
+                : theme_.barColour(roles[i]);
         }
 
         std::ostringstream out;
@@ -980,17 +1073,20 @@ private:
         emit(out, row, margin + theme_.text() + status);
         emit(out, row, "");
 
-        /* --- the bar chart, drawn top row first --- */
+        /* --- the bar chart, drawn top row first, with the code panel beside it --- */
         for (int line = layout.height; line >= 1; --line) {
             std::string rendered = margin;
             for (size_t i = 0; i < data.size(); ++i) {
-                if (heights[i] >= line)
-                    rendered += theme_.barColour(roles[i]) +
-                                util::repeat(g.block, layout.barWidth);
+                if (heights[i] >= line * 2)
+                    rendered += barColours[i] + util::repeat(g.block, layout.barWidth);
+                else if (heights[i] == line * 2 - 1)
+                    rendered += barColours[i] + util::repeat(g.halfBlock, layout.barWidth);
                 else
                     rendered += std::string(static_cast<size_t>(layout.barWidth), ' ');
                 rendered += std::string(static_cast<size_t>(layout.gap), ' ');
             }
+            if (layout.showCode)
+                rendered += codePanelRow(layout, layout.height - line);
             emit(out, row, rendered);
         }
 
@@ -999,7 +1095,7 @@ private:
 
         std::string valueRow = margin;
         for (size_t i = 0; i < data.size(); ++i) {
-            valueRow += theme_.barColour(roles[i]) +
+            valueRow += barColours[i] +
                         util::padCentre(std::to_string(data[i]), layout.barWidth) +
                         std::string(static_cast<size_t>(layout.gap), ' ');
         }
@@ -1065,6 +1161,18 @@ private:
             emit(out, row, margin + theme_.dim() + g.vertical + theme_.text() +
                            util::padRight(right.str(), layout.panelWidth) +
                            theme_.dim() + g.vertical);
+
+            /* Live "how sorted is it" meter - see sortedness() for why this is
+             * measured in inversions rather than in steps completed. */
+            const int meterWidth = 26;
+            std::string label  = " Sorted : ";
+            std::string filled = meter(sortedness(data), meterWidth);
+            int used = util::displayWidth(label) + meterWidth + 5;
+            emit(out, row, margin + theme_.dim() + g.vertical + theme_.text() + label +
+                           filled + theme_.text() +
+                           std::string(static_cast<size_t>(
+                               layout.panelWidth > used ? layout.panelWidth - used : 0), ' ') +
+                           theme_.dim() + g.vertical);
         }
         emit(out, row, margin + theme_.dim() + g.bottomLeft +
                        util::repeat(g.horizontal, layout.panelWidth) + g.bottomRight);
@@ -1080,6 +1188,73 @@ private:
         std::cout << std::flush;
     }
 
+    /*
+     * One row of the pseudocode panel that runs down the right of the chart.
+     *
+     * `slot` counts from the top of the chart: 0 is the panel title, 1 the
+     * rule beneath it, and the rest are the algorithm's own lines.  The line
+     * the algorithm is executing right now is marked and lit up, so the code
+     * and the bars tell the same story at the same instant.
+     */
+    std::string codePanelRow(const Layout& layout, int slot) const {
+        const Glyphs& g = theme_.glyphs();
+        std::string cell(kCodeGutter - 1, ' ');
+        cell += theme_.dim() + g.vertical + "  ";
+
+        if (slot == 0)
+            return cell + theme_.accent() + codeTitle_;
+        if (slot == 1)
+            return cell + theme_.dim() +
+                   util::repeat(g.horizontal, layout.codeWidth - 3);
+
+        size_t index = static_cast<size_t>(slot - 2);
+        if (index >= code_.size()) return cell;
+
+        const bool active = (static_cast<int>(index) == codeLine_);
+        if (active)
+            return cell + theme_.title() + g.marker + " " + code_[index];
+        return cell + theme_.dim() + "  " + code_[index];
+    }
+
+    /*
+     * How close the array is to being sorted, as a fraction from 0 to 1.
+     *
+     * This counts inversions - pairs that are in the wrong order relative to
+     * each other - against the worst possible number of them.  It is a far
+     * more honest progress bar than "elements visited", because it actually
+     * measures disorder draining out of the array: Bubble Sort creeps up it
+     * steadily, while Quick Sort jumps in steps as each pivot lands.
+     */
+    static double sortedness(const std::vector<int>& data) {
+        size_t n = data.size();
+        if (n < 2) return 1.0;
+        long long inversions = 0;
+        for (size_t i = 0; i < n; ++i)
+            for (size_t j = i + 1; j < n; ++j)
+                if (data[i] > data[j]) ++inversions;
+        long long worst = static_cast<long long>(n) * static_cast<long long>(n - 1) / 2;
+        return 1.0 - static_cast<double>(inversions) / static_cast<double>(worst);
+    }
+
+    /* A small filled meter, e.g. "████████░░░░  67%". */
+    std::string meter(double fraction, int width) const {
+        const Glyphs& g = theme_.glyphs();
+        if (fraction < 0.0) fraction = 0.0;
+        if (fraction > 1.0) fraction = 1.0;
+        int filled = static_cast<int>(fraction * width + 0.5);
+
+        std::string colour = fraction >= 0.999 ? theme_.ok()
+                           : fraction >= 0.65  ? theme_.barColour(ROLE_SORTED)
+                           : fraction >= 0.35  ? theme_.warn()
+                                               : theme_.error();
+        std::ostringstream out;
+        out << colour << util::repeat(g.block, filled)
+            << theme_.dim() << util::repeat(g.shade, width - filled)
+            << theme_.text() << " " << util::padLeft(
+                   std::to_string(static_cast<int>(fraction * 100.0 + 0.5)) + "%", 4);
+        return out.str();
+    }
+
     /* Write one screen line: theme background, content, clear to end of line. */
     void emit(std::ostringstream& out, int& row, const std::string& content) const {
         out << theme_.base() << content << theme_.base();
@@ -1092,9 +1267,10 @@ private:
         std::ostringstream out;
         out << "  " << theme_.dim() << "[Space]" << theme_.text() << " pause   "
             << theme_.dim() << "[+/-]"   << theme_.text() << " speed   "
-            << theme_.dim() << "[S]"     << theme_.text() << " step mode   "
+            << theme_.dim() << "[S]"     << theme_.text() << " step   "
+            << theme_.dim() << "[C]"     << theme_.text() << " code   "
             << theme_.dim() << "[Q]"     << theme_.text() << " abort"
-            << theme_.dim() << "        Speed: " << theme_.accent() << currentSpeedName()
+            << theme_.dim() << "     Speed: " << theme_.accent() << currentSpeedName()
             << theme_.dim() << " (" << currentDelay() << " ms)"
             << (stepMode_ ? std::string("  ") + theme_.warn() + "[STEP MODE]" : std::string());
         return out.str();
@@ -1149,6 +1325,10 @@ private:
                 stepMode_ = !stepMode_;
                 showBanner("");
                 break;
+            case 'c':
+                showCode_ = !showCode_;
+                showBanner("");
+                break;
             default:
                 break;
         }
@@ -1183,9 +1363,12 @@ private:
 
     /* Rows a frame uses for everything except the bars themselves:
      * 3 banner + 1 blank + 1 status + 1 blank + 1 axis + 1 values + 1 indices
-     * + 1 blank + 2 legend + 1 blank + 4 statistics box + 1 blank + 1 controls
-     * = 20, plus one spare line so the cursor never forces a scroll. */
-    static const int kFixedRows = 21;
+     * + 1 blank + 2 legend + 1 blank + 5 statistics box + 1 blank + 1 controls
+     * = 21, plus one spare line so the cursor never forces a scroll. */
+    static const int kFixedRows = 22;
+
+    /* Blank columns between the right edge of the chart and the code panel. */
+    static const int kCodeGutter = 4;
 
     /* ---- speed table ---------------------------------------------------- */
     struct SpeedSetting { const char* name; int delayMs; };
@@ -1199,6 +1382,10 @@ private:
     int                      speedIndex_;
     int                      controlsRow_;
     bool                     aborted_;
+    bool                     showCode_;
+    int                      codeLine_;
+    std::string              codeTitle_;
+    std::vector<std::string> code_;
     std::string              algorithmName_;
     std::string              subtitle_;
     std::string              complexity_;
@@ -1208,6 +1395,7 @@ private:
 const int    Visualizer::kSpeedCount;
 const int    Visualizer::kDefaultSpeed;
 const int    Visualizer::kFixedRows;
+const int    Visualizer::kCodeGutter;
 const size_t Visualizer::kLegendRows;
 const Visualizer::SpeedSetting Visualizer::kSpeeds[Visualizer::kSpeedCount] = {
     { "Very Slow", 700 },
@@ -1248,6 +1436,11 @@ public:
     virtual std::string category()    const = 0;
     virtual Complexity  complexity()  const = 0;
     virtual std::string description() const = 0;
+
+    /* The algorithm written out as pseudocode.  The visualiser prints this
+     * beside the chart and lights up whichever line is executing, so the code
+     * and the bars stay in step with each other. */
+    virtual std::vector<std::string> pseudocode() const = 0;
 
     const Statistics& stats() const { return stats_; }
 
@@ -1324,7 +1517,7 @@ public:
         /* 1. The animated run the user actually watches. */
         stats_.reset();
         viz_.setSilent(false);
-        viz_.beginRun(name(), category(), complexity().average, legend());
+        viz_.beginRun(name(), category(), complexity().average, legend(), pseudocode());
         try {
             sort(data);
             finalSweep(data);
@@ -1387,16 +1580,32 @@ protected:
         stats_.countWrite();
     }
 
-    /* Closing animation: sweep left to right turning every bar green. */
+    /*
+     * Closing animation.  First a left to right sweep that confirms each
+     * element in place, then a bright crest that runs back across the finished
+     * array - a small piece of theatre that makes it obvious the run is over
+     * rather than just stopped.
+     */
     void finalSweep(const std::vector<int>& data) {
         if (!animating()) return;
         int n = static_cast<int>(data.size());
+
+        viz_.setCodeLine(-1);
         for (int i = 0; i <= n; ++i) {
             RoleMap roles(data.size(), ROLE_NORMAL);
             roles.setRange(0, i - 1, ROLE_SORTED);
             std::ostringstream status;
-            status << "Verifying result . . .  " << i << " / " << n << " elements confirmed in place";
+            status << "Verifying result . . .  " << i << " / " << n
+                   << " elements confirmed in place";
             viz_.frame(data, roles.get(), status.str(), stats_);
+        }
+
+        /* The crest is two bars wide so it reads as movement, not a flicker. */
+        for (int crest = n - 1; crest >= -1; --crest) {
+            RoleMap roles(data.size(), ROLE_SORTED);
+            roles.set(crest, ROLE_FOUND).set(crest + 1, ROLE_FOUND);
+            viz_.frame(data, roles.get(),
+                       "Sorted. Every element is in its final position.", stats_);
         }
     }
 };
@@ -1427,7 +1636,7 @@ public:
         int result = -1;
         stats_.reset();
         viz_.setSilent(false);
-        viz_.beginRun(name(), category(), complexity().average, legend());
+        viz_.beginRun(name(), category(), complexity().average, legend(), pseudocode());
         try {
             result = search(data, target);
             showOutcome(data, target, result);
@@ -1499,6 +1708,19 @@ public:
                "order, so the largest value 'bubbles' to the end on every pass.";
     }
 
+    std::vector<std::string> pseudocode() const {
+        std::vector<std::string> code;
+        code.push_back("for pass = 0 .. n-2");          // 0
+        code.push_back("  swapped = false");            // 1
+        code.push_back("  for j = 0 .. n-pass-2");      // 2
+        code.push_back("    if A[j] > A[j+1]");         // 3
+        code.push_back("      swap A[j], A[j+1]");      // 4
+        code.push_back("      swapped = true");         // 5
+        code.push_back("  if not swapped");             // 6
+        code.push_back("    break        // sorted");   // 7
+        return code;
+    }
+
 protected:
     void sort(std::vector<int>& data) {
         int n = static_cast<int>(data.size());
@@ -1508,6 +1730,7 @@ protected:
 
             for (int j = 0; j < n - pass - 1; ++j) {
                 animate([&]() {
+                    viz_.setCodeLine(3);
                     RoleMap roles(data.size());
                     roles.setRange(n - pass, n - 1, ROLE_SORTED)
                          .set(j, ROLE_COMPARE).set(j + 1, ROLE_COMPARE);
@@ -1524,6 +1747,7 @@ protected:
                     RoleMap     swapping(animating() ? data.size() : 0);
                     std::string message;
                     animate([&]() {
+                        viz_.setCodeLine(4);
                         swapping.setRange(n - pass, n - 1, ROLE_SORTED)
                                 .set(j, ROLE_SWAP).set(j + 1, ROLE_SWAP);
                         std::ostringstream status;
@@ -1544,6 +1768,7 @@ protected:
             /* Optimisation: a pass with no swaps means the array is sorted. */
             if (!swappedThisPass) {
                 animate([&]() {
+                    viz_.setCodeLine(7);
                     RoleMap roles(data.size(), ROLE_SORTED);
                     std::ostringstream status;
                     status << "Pass " << (pass + 1) << " completed with zero swaps"
@@ -1571,6 +1796,18 @@ public:
                "swaps it into the boundary position - one exact swap per pass.";
     }
 
+    std::vector<std::string> pseudocode() const {
+        std::vector<std::string> code;
+        code.push_back("for i = 0 .. n-2");            // 0
+        code.push_back("  min = i");                   // 1
+        code.push_back("  for j = i+1 .. n-1");        // 2
+        code.push_back("    if A[j] < A[min]");        // 3
+        code.push_back("      min = j");               // 4
+        code.push_back("  if min != i");               // 5
+        code.push_back("    swap A[i], A[min]");       // 6
+        return code;
+    }
+
     std::vector<LegendEntry> legend() const {
         std::vector<LegendEntry> entries;
         entries.push_back(LegendEntry(ROLE_NORMAL,  "unsorted"));
@@ -1590,6 +1827,7 @@ protected:
 
             for (int j = i + 1; j < n; ++j) {
                 animate([&]() {
+                    viz_.setCodeLine(3);
                     RoleMap roles(data.size());
                     roles.setRange(0, i - 1, ROLE_SORTED)
                          .set(i, ROLE_ACTIVE)
@@ -1606,6 +1844,7 @@ protected:
                 if (greater(data, minimumIndex, j)) {
                     minimumIndex = j;
                     animate([&]() {
+                        viz_.setCodeLine(4);
                         RoleMap update(data.size());
                         update.setRange(0, i - 1, ROLE_SORTED)
                               .set(i, ROLE_ACTIVE)
@@ -1623,6 +1862,7 @@ protected:
                 RoleMap     swapping(animating() ? data.size() : 0);
                 std::string message;
                 animate([&]() {
+                    viz_.setCodeLine(6);
                     swapping.setRange(0, i - 1, ROLE_SORTED)
                             .set(i, ROLE_SWAP).set(minimumIndex, ROLE_SWAP);
                     std::ostringstream status;
@@ -1636,6 +1876,7 @@ protected:
                 animate([&]() { viz_.frame(data, swapping.get(), message, stats_); });
             } else {
                 animate([&]() {
+                    viz_.setCodeLine(5);
                     RoleMap roles(data.size());
                     roles.setRange(0, i, ROLE_SORTED);
                     std::ostringstream status;
@@ -1664,6 +1905,19 @@ public:
                "value left until it lands in the right place - like sorting cards.";
     }
 
+    std::vector<std::string> pseudocode() const {
+        std::vector<std::string> code;
+        code.push_back("for i = 1 .. n-1");            // 0
+        code.push_back("  key = A[i]");                // 1
+        code.push_back("  j = i - 1");                 // 2
+        code.push_back("  while j >= 0 and");          // 3
+        code.push_back("        A[j] > key");          // 4
+        code.push_back("    A[j+1] = A[j]");           // 5
+        code.push_back("    j = j - 1");               // 6
+        code.push_back("  A[j+1] = key");              // 7
+        return code;
+    }
+
     std::vector<LegendEntry> legend() const {
         std::vector<LegendEntry> entries;
         entries.push_back(LegendEntry(ROLE_SORTED,  "sorted prefix"));
@@ -1683,6 +1937,7 @@ protected:
             int j   = i - 1;
 
             animate([&]() {
+                viz_.setCodeLine(1);
                 RoleMap roles(data.size());
                 roles.setRange(0, i - 1, ROLE_SORTED).set(i, ROLE_ACTIVE);
                 std::ostringstream status;
@@ -1697,6 +1952,7 @@ protected:
                 RoleMap     roles(animating() ? data.size() : 0);
                 std::string message;
                 animate([&]() {
+                    viz_.setCodeLine(5);
                     roles.setRange(0, i - 1, ROLE_SORTED)
                          .set(j, ROLE_COMPARE).set(j + 1, ROLE_SWAP);
                     std::ostringstream status;
@@ -1716,6 +1972,7 @@ protected:
 
             writeAt(data, j + 1, key);
             animate([&]() {
+                viz_.setCodeLine(7);
                 RoleMap roles(data.size());
                 roles.setRange(0, i, ROLE_SORTED).set(j + 1, ROLE_ACTIVE);
                 std::ostringstream status;
@@ -1743,6 +2000,20 @@ public:
                "merges the sorted halves back together in linear time.";
     }
 
+    std::vector<std::string> pseudocode() const {
+        std::vector<std::string> code;
+        code.push_back("mergeSort(lo, hi)");           // 0
+        code.push_back("  if lo >= hi: return");       // 1
+        code.push_back("  mid = (lo + hi) / 2");       // 2
+        code.push_back("  mergeSort(lo, mid)");        // 3
+        code.push_back("  mergeSort(mid+1, hi)");      // 4
+        code.push_back("  merge:");                    // 5
+        code.push_back("    take smaller front");      // 6
+        code.push_back("    write it to A[k]");        // 7
+        code.push_back("    copy any remainder");      // 8
+        return code;
+    }
+
     std::vector<LegendEntry> legend() const {
         std::vector<LegendEntry> entries;
         entries.push_back(LegendEntry(ROLE_NORMAL,  "outside range"));
@@ -1768,6 +2039,7 @@ private:
         int middle = low + (high - low) / 2;
 
         animate([&]() {
+            viz_.setCodeLine(2);
             RoleMap roles(data.size());
             roles.setRange(low, high, ROLE_RANGE);
             std::ostringstream status;
@@ -1794,6 +2066,7 @@ private:
 
         while (i < left.size() && j < right.size()) {
             animate([&]() {
+                viz_.setCodeLine(6);
                 int leftIndex  = low + static_cast<int>(i);
                 int rightIndex = middle + 1 + static_cast<int>(j);
                 /* The write cursor is marked before the two fronts, so that
@@ -1821,6 +2094,7 @@ private:
             writeAt(data, k, chosen);
 
             animate([&]() {
+                viz_.setCodeLine(7);
                 RoleMap after(data.size());
                 after.setRange(low, high, ROLE_RANGE)
                      .setRange(low, k, ROLE_SORTED)
@@ -1846,6 +2120,7 @@ private:
         }
 
         animate([&]() {
+            viz_.setCodeLine(5);
             RoleMap done(data.size());
             done.setRange(low, high, ROLE_SORTED);
             std::ostringstream status;
@@ -1858,6 +2133,7 @@ private:
     void drawTail(const std::vector<int>& data, int low, int high, int k,
                   const std::string& side) {
         animate([&]() {
+            viz_.setCodeLine(8);
             RoleMap roles(data.size());
             roles.setRange(low, high, ROLE_RANGE)
                  .setRange(low, k, ROLE_SORTED)
@@ -1884,6 +2160,21 @@ public:
     std::string description() const {
         return "Picks the last element as a pivot, partitions everything smaller "
                "to its left and larger to its right, then recurses on both sides.";
+    }
+
+    std::vector<std::string> pseudocode() const {
+        std::vector<std::string> code;
+        code.push_back("quickSort(lo, hi)");           // 0
+        code.push_back("  if lo >= hi: return");       // 1
+        code.push_back("  pivot = A[hi]");             // 2
+        code.push_back("  i = lo - 1");                // 3
+        code.push_back("  for j = lo .. hi-1");        // 4
+        code.push_back("    if A[j] <= pivot");        // 5
+        code.push_back("      i = i + 1");             // 6
+        code.push_back("      swap A[i], A[j]");       // 7
+        code.push_back("  swap A[i+1], A[hi]");        // 8
+        code.push_back("  recurse both sides");        // 9
+        return code;
     }
 
     std::vector<LegendEntry> legend() const {
@@ -1925,6 +2216,7 @@ private:
         placed_[static_cast<size_t>(pivotIndex)] = true;
 
         animate([&]() {
+            viz_.setCodeLine(9);
             RoleMap roles = baseRoles(data.size(), low, high);
             roles.set(pivotIndex, ROLE_SORTED);
             std::ostringstream status;
@@ -1946,6 +2238,7 @@ private:
         int boundary   = low - 1;
 
         animate([&]() {
+            viz_.setCodeLine(2);
             RoleMap roles = baseRoles(data.size(), low, high);
             roles.set(high, ROLE_PIVOT);
             std::ostringstream status;
@@ -1956,6 +2249,7 @@ private:
 
         for (int j = low; j < high; ++j) {
             animate([&]() {
+                viz_.setCodeLine(5);
                 RoleMap roles = baseRoles(data.size(), low, high);
                 roles.set(high, ROLE_PIVOT).set(j, ROLE_COMPARE);
                 if (boundary >= low) roles.set(boundary, ROLE_ACTIVE);
@@ -1970,6 +2264,7 @@ private:
                 RoleMap     swapping(animating() ? data.size() : 0);
                 std::string message;
                 animate([&]() {
+                    viz_.setCodeLine(7);
                     swapping = baseRoles(data.size(), low, high);
                     swapping.set(high, ROLE_PIVOT)
                             .set(j, ROLE_SWAP).set(boundary, ROLE_SWAP);
@@ -1989,6 +2284,7 @@ private:
         }
 
         animate([&]() {
+            viz_.setCodeLine(8);
             RoleMap roles = baseRoles(data.size(), low, high);
             roles.set(high, ROLE_SWAP).set(boundary + 1, ROLE_SWAP);
             std::ostringstream status;
@@ -2024,11 +2320,21 @@ public:
                "up. No ordering required, but no shortcuts either.";
     }
 
+    std::vector<std::string> pseudocode() const {
+        std::vector<std::string> code;
+        code.push_back("for i = 0 .. n-1");            // 0
+        code.push_back("  if A[i] == target");         // 1
+        code.push_back("    return i");                // 2
+        code.push_back("return NOT FOUND");            // 3
+        return code;
+    }
+
 protected:
     int search(const std::vector<int>& data, int target) {
         int n = static_cast<int>(data.size());
         for (int i = 0; i < n; ++i) {
             animate([&]() {
+                viz_.setCodeLine(1);
                 RoleMap roles(data.size());
                 roles.setRange(0, i - 1, ROLE_DISCARDED).set(i, ROLE_COMPARE);
                 std::ostringstream status;
@@ -2040,6 +2346,7 @@ protected:
 
             if (equals(data, i, target)) {
                 animate([&]() {
+                    viz_.setCodeLine(2);
                     RoleMap hit(data.size());
                     hit.setRange(0, i - 1, ROLE_DISCARDED).set(i, ROLE_FOUND);
                     std::ostringstream found;
@@ -2069,6 +2376,20 @@ public:
                "away the half that cannot contain the target.";
     }
 
+    std::vector<std::string> pseudocode() const {
+        std::vector<std::string> code;
+        code.push_back("search(lo, hi)");              // 0
+        code.push_back("  if lo > hi: NOT FOUND");     // 1
+        code.push_back("  mid = lo + (hi-lo)/2");      // 2
+        code.push_back("  if A[mid] == target");       // 3
+        code.push_back("    return mid");              // 4
+        code.push_back("  if A[mid] < target");        // 5
+        code.push_back("    search(mid+1, hi)");       // 6
+        code.push_back("  else");                      // 7
+        code.push_back("    search(lo, mid-1)");       // 8
+        return code;
+    }
+
     bool requiresSortedInput() const { return true; }
 
     std::vector<LegendEntry> legend() const {
@@ -2090,6 +2411,7 @@ private:
     int binarySearch(const std::vector<int>& data, int target, int low, int high) {
         if (low > high) {
             animate([&]() {
+                viz_.setCodeLine(1);
                 RoleMap roles(data.size(), ROLE_DISCARDED);
                 std::ostringstream status;
                 status << "The search range is empty (low=" << low << " > high=" << high
@@ -2106,6 +2428,7 @@ private:
          * one colour, the eliminated half greyed out, the midpoint picked out. */
         RoleMap roles(animating() ? data.size() : 0, ROLE_RANGE);
         animate([&]() {
+            viz_.setCodeLine(2);
             roles.setOutside(low, high, ROLE_DISCARDED).set(middle, ROLE_PIVOT);
             std::ostringstream status;
             status << "Range A[" << low << ".." << high << "]  (" << (high - low + 1)
@@ -2117,6 +2440,7 @@ private:
         int result;
         if (equals(data, middle, target)) {
             animate([&]() {
+                viz_.setCodeLine(4);
                 RoleMap hit(data.size(), ROLE_DISCARDED);
                 hit.set(middle, ROLE_FOUND);
                 std::ostringstream status;
@@ -2126,6 +2450,7 @@ private:
             result = middle;
         } else if (lessThanTarget(data, middle, target)) {
             animate([&]() {
+                viz_.setCodeLine(6);
                 std::ostringstream status;
                 status << "A[" << middle << "]=" << data[middle] << " < " << target
                        << "  ->  discard the left half, search A[" << (middle + 1)
@@ -2135,6 +2460,7 @@ private:
             result = binarySearch(data, target, middle + 1, high);
         } else {
             animate([&]() {
+                viz_.setCodeLine(8);
                 std::ostringstream status;
                 status << "A[" << middle << "]=" << data[middle] << " > " << target
                        << "  ->  discard the right half, search A[" << low
@@ -2164,6 +2490,7 @@ public:
     }
 
     void run() {
+        showSplash();
         showWelcome();
         while (true) {
             if (!mainMenu()) break;
@@ -2264,6 +2591,90 @@ private:
         for (size_t i = 1; i < data.size(); ++i)
             if (data[i - 1] > data[i]) return false;
         return true;
+    }
+
+    /* ---- splash ---------------------------------------------------------- */
+
+    /*
+     * Block letter title, revealed a column at a time and then lit by a
+     * travelling crest.  Purely decorative - it is skipped entirely on a
+     * terminal that cannot animate, and any key press cuts it short.
+     */
+    void showSplash() const {
+        if (!Console::richOutput()) return;
+
+        /* '#' marks a filled cell; the glyph is substituted at draw time so
+         * ASCII mode gets the same title in '#' characters. */
+        static const char* letterD[5] =
+            {"###### ", "##   ##", "##   ##", "##   ##", "###### "};
+        static const char* letterS[5] =
+            {" ######", "##     ", " ##### ", "     ##", "###### "};
+        static const char* letterA[5] =
+            {" ##### ", "##   ##", "#######", "##   ##", "##   ##"};
+
+        std::vector<std::string> masks;
+        for (int r = 0; r < 5; ++r)
+            masks.push_back(std::string(letterD[r]) + "  " +
+                            std::string(letterS[r]) + "  " +
+                            std::string(letterA[r]));
+        const int width = static_cast<int>(masks[0].size());
+
+        for (int visible = 0; visible <= width; ++visible) {
+            if (Console::keyAvailable()) { Console::readKey(); break; }
+            drawSplash(masks, visible, -1);
+            Console::sleepMs(16);
+        }
+        for (int crest = -2; crest <= width + 2; ++crest) {
+            if (Console::keyAvailable()) { Console::readKey(); break; }
+            drawSplash(masks, width, crest);
+            Console::sleepMs(11);
+        }
+        drawSplash(masks, width, -1);
+        Console::sleepMs(220);
+    }
+
+    void drawSplash(const std::vector<std::string>& masks,
+                    int visible, int crest) const {
+        const int width  = static_cast<int>(masks[0].size());
+        const int indent = 6;
+
+        std::ostringstream out;
+        out << theme_.base();
+        for (int i = 0; i < 4; ++i) out << theme_.base() << "\x1b[K\n";
+
+        for (size_t r = 0; r < masks.size(); ++r) {
+            out << theme_.base() << std::string(indent, ' ');
+            for (int c = 0; c < width && c < visible; ++c) {
+                if (masks[r][static_cast<size_t>(c)] != '#') { out << ' '; continue; }
+                int distance = c - crest;
+                if (distance < 0) distance = -distance;
+                if (crest >= 0 && distance <= 1)
+                    out << theme_.title();
+                else
+                    out << theme_.gradientColour(
+                        0.30 + 0.70 * (static_cast<double>(c) / (width - 1)));
+                out << theme_.glyphs().block;
+            }
+            out << theme_.base() << "\x1b[K\n";
+        }
+
+        out << theme_.base() << "\x1b[K\n";
+        if (visible >= width) {
+            out << theme_.base() << std::string(indent, ' ') << theme_.accent()
+                << "S O R T I N G   &   S E A R C H I N G   V I S U A L I Z E R"
+                << theme_.base() << "\x1b[K\n";
+            out << theme_.base() << "\x1b[K\n";
+            out << theme_.base() << std::string(indent, ' ') << theme_.dim()
+                << "Minor Project " << theme_.glyphs().bullet
+                << " C++ / STL / OOP " << theme_.glyphs().bullet
+                << " every algorithm written from scratch"
+                << theme_.base() << "\x1b[K\n";
+        }
+
+        Console::home();
+        std::cout << out.str();
+        Console::clearBelow();
+        std::cout << std::flush;
     }
 
     /* ---- welcome / goodbye ---------------------------------------------- */
@@ -2874,6 +3285,9 @@ private:
             statLine("Theme",           theme_.modeName() + " mode");
             statLine("Character set",   theme_.asciiMode() ? "ASCII only (maximum compatibility)"
                                                            : "Unicode block graphics");
+            statLine("Pseudocode panel", viz_.showCode()
+                     ? "ON - shown beside the chart when the window is wide enough"
+                     : "OFF");
             line();
             sectionRule();
             line();
@@ -2883,17 +3297,20 @@ private:
                      theme_.mode() == THEME_DARK ? "switch to Light" : "switch to Dark");
             menuItem(4, "Toggle Unicode / ASCII bars",
                      theme_.asciiMode() ? "switch to Unicode" : "switch to ASCII");
+            menuItem(5, "Toggle pseudocode panel",
+                     viz_.showCode() ? "turn OFF" : "turn ON");
             line();
             menuItem(0, "Back to main menu");
             line();
 
-            int choice = input_.readChoice(0, 4);
+            int choice = input_.readChoice(0, 5);
             if (choice == 0) return;
             switch (choice) {
                 case 1: speedMenu();                                   break;
                 case 2: viz_.setStepMode(!viz_.stepMode());            break;
                 case 3: theme_.toggleMode();                           break;
                 case 4: theme_.setAsciiMode(!theme_.asciiMode());      break;
+                case 5: viz_.setShowCode(!viz_.showCode());            break;
             }
         }
     }
@@ -2937,6 +3354,7 @@ private:
         controlHelp("Space", "pause and resume");
         controlHelp("+ / -", "speed the animation up or slow it down");
         controlHelp("S",     "step mode: one frame per key press");
+        controlHelp("C",     "show or hide the live pseudocode panel");
         controlHelp("Q",     "abort the animation (results are still computed)");
         line();
         line("   " + theme_.dim() +
